@@ -5,6 +5,7 @@ from copy import deepcopy
 import hashlib
 import importlib.metadata
 import json
+import os
 from pathlib import Path
 import subprocess
 from tempfile import TemporaryDirectory
@@ -161,6 +162,66 @@ class AttemptTests(unittest.TestCase):
                                         Path(tmp) / 'lock', Path(tmp) / 'attempt')
             self.assertEqual(result['status'], 'EXPORT_FAILED_RETAINED_LOGS')
             self.assertFalse((Path(tmp) / 'attempt/llama3_2_1b_export.json').exists())
+
+
+STUB_EXPORT_MODULE = '''"""Stand-in for extension.llm.export.export_llm."""
+import json
+import sys
+from pathlib import Path
+
+config = json.loads(Path(sys.argv[sys.argv.index("--config") + 1]).read_text())
+out_dir = Path(config["export"]["output_dir"])
+out_dir.mkdir(parents=True, exist_ok=True)
+artifact = out_dir / (config["export"]["output_name"] + ".pte")
+artifact.write_bytes(b"\\x00\\x00\\x00\\x00ET12" + b"stub artifact bytes")
+print("stub export stdout")
+print("stub export stderr", file=sys.stderr)
+'''
+
+
+def add_stub_export_module(checkout):
+    module_dir = Path(checkout) / 'extension/llm/export'
+    module_dir.mkdir(parents=True)
+    for package in (Path(checkout) / 'extension', Path(checkout) / 'extension/llm',
+                    module_dir):
+        (package / '__init__.py').write_text('')
+    (module_dir / 'export_llm.py').write_text(STUB_EXPORT_MODULE)
+
+
+class SubprocessWiringTests(unittest.TestCase):
+    def test_relative_output_with_spaces_runs_real_stub_subprocess(self):
+        """The export child runs with the pinned checkout as cwd; a relative
+        --config would resolve there and fail. Run the real subprocess path
+        (no run_export mock) from a cwd with spaces, with a relative --output,
+        to prove the config path handed to the child is absolute."""
+        with TemporaryDirectory() as tmp:
+            profile, reference, checkout, weights, assets, schema = make_world(tmp)
+            add_stub_export_module(checkout)
+            for name, content in (('p', profile), ('a', assets), ('r', reference),
+                                  ('s', schema)):
+                (Path(tmp) / name).write_text(json.dumps(content))
+            (Path(tmp) / 'lock').write_text('#\n')
+            spaced = Path(tmp) / 'dir with spaces'
+            spaced.mkdir()
+            previous_cwd = os.getcwd()
+            os.chdir(spaced)
+            try:
+                result = export_attempt(Path(tmp) / 'p', Path(tmp) / 's',
+                                        Path(tmp) / 'r', checkout, weights,
+                                        Path(tmp) / 'a', Path(tmp) / 'lock',
+                                        Path('relative attempt 02'))
+            finally:
+                os.chdir(previous_cwd)
+            self.assertEqual(result['status'], 'EXPORTED_STAGED_NOT_COMMITTED', result)
+            attempt = spaced / 'relative attempt 02'
+            config_arg = result['export_process']['argv'][
+                result['export_process']['argv'].index('--config') + 1]
+            self.assertTrue(Path(config_arg).is_absolute(), config_arg)
+            self.assertTrue((attempt / 'export.stdout.log').read_text().strip())
+            manifest = json.loads((attempt / 'llama3_2_1b_export.json').read_text())
+            pte = attempt / 'exported/llama3_2_1b_xnnpack.pte'
+            self.assertEqual(manifest['artifact']['sha256'],
+                             hashlib.sha256(pte.read_bytes()).hexdigest())
 
 
 if __name__ == '__main__':
