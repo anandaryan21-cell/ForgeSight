@@ -80,7 +80,7 @@ def write_json(directory, name, payload):
     return target
 
 
-def copy_small_json(source, directory):
+def copy_small_json(source, directory, target_name=None):
     source = Path(source)
     if not source.is_file():
         return {"source": str(source), "copied": False, "reason": "not a file"}
@@ -91,7 +91,7 @@ def copy_small_json(source, directory):
     except (ValueError, UnicodeDecodeError) as exc:
         return {"source": str(source), "copied": False,
                 "reason": "not parseable JSON: {}".format(exc)}
-    target = directory / source.name
+    target = directory / (target_name or source.name)
     if target.exists():
         return {"source": str(source), "copied": False, "reason": "name already in bundle"}
     shutil.copyfile(str(source), str(target))
@@ -264,8 +264,16 @@ def collect_inventory(args, bundle, git_payload, llama_root, discovery, runs, mi
         missing.append({"item": "saved inspection record.json files",
                         "status": "NONE_FOUND",
                         "detail": "searched: {}".format(runs["run_roots"])})
-    copied_records = [copy_small_json(Path(record), bundle) for record in runs["records"]]
-    copied_extra = [copy_small_json(Path(path), bundle) for path in runs["extra_jsons"]]
+    # Unique bundle names: every run's record is record.json, and sibling run
+    # JSONs share names across runs; the position prefix keeps every copy and
+    # ties it to the token_budget_NN.json of the same position. The
+    # source/bundle_file pairs are the provenance map.
+    copied_records = [copy_small_json(Path(record), bundle,
+                                      "record_{:02d}.json".format(position))
+                      for position, record in enumerate(runs["records"])]
+    copied_extra = [copy_small_json(Path(path), bundle,
+                                    "runjson_{:02d}_{}".format(position, Path(path).name))
+                    for position, path in enumerate(runs["extra_jsons"])]
     copied_reports = [copy_small_json(source, bundle) for source in args.report]
     write_json(bundle, "copied_reports.json",
                {"records": copied_records, "run_jsons": copied_extra,

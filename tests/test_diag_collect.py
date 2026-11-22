@@ -66,6 +66,28 @@ class DiagCollectDiscoveryTest(unittest.TestCase):
             missing = json.loads((bundle / 'missing_items.json').read_text())
             self.assertFalse(missing['collected_everything'])
 
+    def test_same_named_records_and_run_jsons_all_copied_uniquely(self):
+        with tempfile.TemporaryDirectory() as workdir, tempfile.TemporaryDirectory() as home:
+            make_install(Path(home) / '.local/share/forgesight/llama_cpu_v1')
+            for run in ('run_a', 'run_b'):
+                run_dir = Path(home) / '.local/share/forgesight/vision_cpu_v1/runs' / run
+                run_dir.mkdir(parents=True)
+                (run_dir / 'record.json').write_text(json.dumps({'run': run}))
+                (run_dir / 'advice_report.json').write_text(json.dumps({'run': run}))
+            result = self.run_collector(workdir, home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            bundle = self.bundle(workdir)
+            copied = json.loads((bundle / 'copied_reports.json').read_text())
+            record_files = [entry.get('bundle_file') for entry in copied['records']]
+            self.assertEqual(sorted(record_files), ['record_00.json', 'record_01.json'])
+            self.assertTrue(all(entry['copied'] for entry in copied['records']))
+            json_files = [entry.get('bundle_file') for entry in copied['run_jsons']]
+            self.assertEqual(len(json_files), len(set(json_files)))
+            self.assertTrue(all(entry['copied'] for entry in copied['run_jsons']))
+            sources = [entry['source'] for entry in copied['records']]
+            self.assertTrue(any('run_a' in s for s in sources))
+            self.assertTrue(any('run_b' in s for s in sources))
+
     def test_unmarked_or_incomplete_install_is_not_selected(self):
         with tempfile.TemporaryDirectory() as workdir, tempfile.TemporaryDirectory() as home:
             make_install(Path(home) / '.local/share/forgesight/llama_cpu_v1', valid=False)
