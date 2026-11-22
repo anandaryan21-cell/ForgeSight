@@ -41,6 +41,19 @@ class CaptureTests(unittest.TestCase):
             self.assertNotEqual(result["returncode"], 0)
             self.assertLess(result["process_wall_seconds"], 5)
 
+    def test_fast_writer_past_log_limit_is_output_limit_even_on_clean_exit(self):
+        """A fast writer can cross the 16 MiB bound and exit 0 between polls;
+        the post-reap size check must still classify OUTPUT_LIMIT. The bound
+        is honest threshold semantics, not a strict on-disk cap."""
+        with tempfile.TemporaryDirectory(prefix="forgesight-process-") as directory:
+            result = capture_process(
+                [sys.executable, "-c",
+                 "import sys; sys.stdout.write('x' * (17 * 1024 * 1024))"],
+                Path(directory), 30)
+            self.assertEqual(result["returncode"], 0)
+            self.assertEqual(result["completion_reason"], "OUTPUT_LIMIT")
+            self.assertGreater(result["stdout_bytes"], 16 * 1024 * 1024)
+
     def test_invalid_timeout_is_rejected_without_logs(self):
         with tempfile.TemporaryDirectory(prefix="forgesight-process-") as directory:
             with self.assertRaises(ValueError):
