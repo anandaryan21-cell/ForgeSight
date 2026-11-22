@@ -113,7 +113,10 @@ class AttemptTests(unittest.TestCase):
                         'stdout_bytes': 0, 'stderr_bytes': 0,
                         'export_working_directory': str(checkout_dir), 'omp_num_threads': 8}
 
-            with patch.object(edge_export_run, 'run_export', fake_export):
+            loaded = {'status': 'ARTIFACT_LOADED_NOT_INFERENCE_VERIFIED',
+                      'method_execution': 'NOT_RUN'}
+            with patch.object(edge_export_run, 'run_export', fake_export), \
+                    patch('forgesight.edge_artifact.inspect_artifact', return_value=loaded):
                 result = export_attempt(profile_path, schema_path,
                                         reference_path, checkout, weights, assets_path,
                                         pylock, output)
@@ -132,10 +135,12 @@ class AttemptTests(unittest.TestCase):
             staged_pte = output / 'exported' / 'llama3_2_1b_xnnpack.pte'
             self.assertEqual(manifest['artifact']['sha256'],
                              hashlib.sha256(staged_pte.read_bytes()).hexdigest())
-            self.assertEqual(manifest['artifact_validation']['status'], 'NOT_RUN_IN_THIS_ENV')
+            self.assertEqual(manifest['artifact_validation']['status'],
+                             'ARTIFACT_LOADED_NOT_INFERENCE_VERIFIED')
             self.assertEqual(manifest['device_inference'], 'BLOCKED_NOT_VERIFIED')
             # A second attempt into the same directory refuses rather than overwriting.
-            with patch.object(edge_export_run, 'run_export', fake_export):
+            with patch.object(edge_export_run, 'run_export', fake_export), \
+                    patch('forgesight.edge_artifact.inspect_artifact', return_value=loaded):
                 again = export_attempt(profile_path, schema_path,
                                        reference_path, checkout, weights, assets_path,
                                        pylock, output)
@@ -162,6 +167,75 @@ class AttemptTests(unittest.TestCase):
                                         Path(tmp) / 'lock', Path(tmp) / 'attempt')
             self.assertEqual(result['status'], 'EXPORT_FAILED_RETAINED_LOGS')
             self.assertFalse((Path(tmp) / 'attempt/llama3_2_1b_export.json').exists())
+
+    def test_killed_export_is_not_a_success(self):
+        """A timeout or log-limit kill (non-EXITED) retains logs and stages no
+        manifest even when the returncode is absent."""
+        with TemporaryDirectory() as tmp:
+            fake_export, (p, s, r), checkout, weights, a, lock, output = \
+                self._attempt_world(tmp, b'\x00\x00\x00\x00ET12' + b'bytes')
+
+            def killed_export(config_path, checkout_dir, attempt_dir):
+                (attempt_dir / 'stdout.log').write_text('partial\n')
+                return {'argv': ['fake'], 'returncode': None,
+                        'completion_reason': 'OUTPUT_LIMIT',
+                        'process_wall_seconds': 0.1, 'sampled_peak_rss_kib': 1,
+                        'rss_sampling_interval_seconds': 0.05, 'memory_note': 'stub',
+                        'stdout_bytes': 8, 'stderr_bytes': 0,
+                        'export_working_directory': str(checkout_dir), 'omp_num_threads': 8}
+
+            with patch.object(edge_export_run, 'run_export', killed_export):
+                result = export_attempt(p, s, r, checkout, weights, a, lock, output)
+            self.assertEqual(result['status'], 'EXPORT_FAILED_RETAINED_LOGS', result)
+            self.assertFalse((output / 'llama3_2_1b_export.json').exists())
+
+    def _attempt_world(self, tmp, pte_bytes):
+        profile, reference, checkout, weights, assets, schema = make_world(tmp)
+        for name, content in (('p', profile), ('a', assets), ('r', reference),
+                              ('s', schema)):
+            (Path(tmp) / name).write_text(json.dumps(content))
+        (Path(tmp) / 'lock').write_text('#\n')
+
+        def fake_export(config_path, checkout_dir, attempt_dir):
+            pte = attempt_dir / 'exported/llama3_2_1b_xnnpack.pte'
+            pte.parent.mkdir(parents=True)
+            pte.write_bytes(pte_bytes)
+            return {'argv': ['fake'], 'returncode': 0, 'completion_reason': 'EXITED',
+                    'process_wall_seconds': 0.1, 'sampled_peak_rss_kib': 1,
+                    'rss_sampling_interval_seconds': 0.1, 'memory_note': 'stub',
+                    'stdout_bytes': 0, 'stderr_bytes': 0,
+                    'export_working_directory': str(checkout_dir), 'omp_num_threads': 8}
+
+        return fake_export, (Path(tmp) / n for n in ('p', 's', 'r')), checkout, weights, \
+            Path(tmp) / 'a', Path(tmp) / 'lock', Path(tmp) / 'attempt'
+
+    def test_unavailable_inspection_stages_no_success_manifest(self):
+        """Without the pinned ExecuTorch environment the artifact cannot be
+        verified, so the attempt is not a staged success: logs are retained,
+        no manifest is written, and the status is a named non-success."""
+        with TemporaryDirectory() as tmp:
+            fake_export, (p, s, r), checkout, weights, a, lock, output = \
+                self._attempt_world(tmp, b'\x00\x00\x00\x00ET12' + b'bytes')
+            with patch.object(edge_export_run, 'run_export', fake_export):
+                result = export_attempt(p, s, r, checkout, weights, a, lock, output)
+            self.assertEqual(result['status'], 'EXPORTED_VALIDATION_NOT_RUN', result)
+            self.assertEqual(result['artifact_validation']['status'], 'NOT_RUN_IN_THIS_ENV')
+            self.assertFalse((output / 'llama3_2_1b_export.json').exists())
+
+    def test_inspection_exception_is_a_named_failure_without_manifest(self):
+        """An import failure or unexpected error inside the inspection is a
+        named failed verification with retained logs, not a traceback and not
+        a staged success."""
+        with TemporaryDirectory() as tmp:
+            fake_export, (p, s, r), checkout, weights, a, lock, output = \
+                self._attempt_world(tmp, b'\x00\x00\x00\x00ET12' + b'bytes')
+            with patch.object(edge_export_run, 'run_export', fake_export), \
+                    patch('forgesight.edge_artifact.inspect_artifact',
+                          side_effect=ImportError('no module named executorch')):
+                result = export_attempt(p, s, r, checkout, weights, a, lock, output)
+            self.assertEqual(result['status'], 'EXPORT_FAILED_ARTIFACT_REJECTED', result)
+            self.assertIn('ImportError', result['artifact_validation']['error'])
+            self.assertFalse((output / 'llama3_2_1b_export.json').exists())
 
 
 STUB_EXPORT_MODULE = '''"""Stand-in for extension.llm.export.export_llm."""
@@ -203,13 +277,16 @@ class SubprocessWiringTests(unittest.TestCase):
             (Path(tmp) / 'lock').write_text('#\n')
             spaced = Path(tmp) / 'dir with spaces'
             spaced.mkdir()
+            loaded = {'status': 'ARTIFACT_LOADED_NOT_INFERENCE_VERIFIED',
+                      'method_execution': 'NOT_RUN'}
             previous_cwd = os.getcwd()
             os.chdir(spaced)
             try:
-                result = export_attempt(Path(tmp) / 'p', Path(tmp) / 's',
-                                        Path(tmp) / 'r', checkout, weights,
-                                        Path(tmp) / 'a', Path(tmp) / 'lock',
-                                        Path('relative attempt 02'))
+                with patch('forgesight.edge_artifact.inspect_artifact', return_value=loaded):
+                    result = export_attempt(Path(tmp) / 'p', Path(tmp) / 's',
+                                            Path(tmp) / 'r', checkout, weights,
+                                            Path(tmp) / 'a', Path(tmp) / 'lock',
+                                            Path('relative attempt 02'))
             finally:
                 os.chdir(previous_cwd)
             self.assertEqual(result['status'], 'EXPORTED_STAGED_NOT_COMMITTED', result)
@@ -217,7 +294,7 @@ class SubprocessWiringTests(unittest.TestCase):
             config_arg = result['export_process']['argv'][
                 result['export_process']['argv'].index('--config') + 1]
             self.assertTrue(Path(config_arg).is_absolute(), config_arg)
-            self.assertTrue((attempt / 'export.stdout.log').read_text().strip())
+            self.assertTrue((attempt / 'stdout.log').read_text().strip())
             manifest = json.loads((attempt / 'llama3_2_1b_export.json').read_text())
             pte = attempt / 'exported/llama3_2_1b_xnnpack.pte'
             self.assertEqual(manifest['artifact']['sha256'],

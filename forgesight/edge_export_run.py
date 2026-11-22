@@ -23,14 +23,15 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-import threading
-import time
 
 from forgesight.edge_assets import fingerprint
+from forgesight.edge_capture import capture_process
 from forgesight.edge_recipe import create_recipe
 
 PACKAGE_PINS = ('torch', 'executorch', 'torchao')
-RSS_SAMPLE_SECONDS = 0.1
+# Same operator bound as the recorded attempt_01 flow (EDGE_RUNTIME.md 2.5):
+# 1800-second timeout and capture_process's 16 MiB combined log limit.
+EXPORT_TIMEOUT_SECONDS = 1800
 
 
 def _package_version(name):
@@ -75,42 +76,17 @@ def readiness(profile, reference, checkout, weights, assets, output):
     return blockers
 
 
-def _sample_rss(pid, samples, stop):
-    while not stop.is_set():
-        try:
-            with open(f'/proc/{pid}/status') as stream:
-                for line in stream:
-                    if line.startswith('VmHWM:'):
-                        samples.append(int(line.split()[1]))
-                        break
-        except OSError:
-            return
-        stop.wait(RSS_SAMPLE_SECONDS)
-
-
 def run_export(config_path, checkout, attempt_dir):
     argv = [sys.executable, '-B', '-m', 'extension.llm.export.export_llm',
             '--config', str(config_path)]
     env = dict(os.environ, OMP_NUM_THREADS='8')
-    started = time.monotonic()
-    with open(attempt_dir / 'export.stdout.log', 'xb') as out, \
-            open(attempt_dir / 'export.stderr.log', 'xb') as err:
-        process = subprocess.Popen(argv, cwd=checkout, stdout=out, stderr=err, env=env)
-        samples, stop = [], threading.Event()
-        sampler = threading.Thread(target=_sample_rss, args=(process.pid, samples, stop),
-                                   daemon=True)
-        sampler.start()
-        returncode = process.wait()
-        stop.set()
-        sampler.join(timeout=2)
-    return {'argv': argv, 'returncode': returncode, 'completion_reason': 'EXITED',
-            'process_wall_seconds': time.monotonic() - started,
-            'sampled_peak_rss_kib': max(samples) if samples else None,
-            'rss_sampling_interval_seconds': RSS_SAMPLE_SECONDS,
-            'memory_note': 'Sampled process VmHWM; may miss peaks and excludes other processes.',
-            'stdout_bytes': (attempt_dir / 'export.stdout.log').stat().st_size,
-            'stderr_bytes': (attempt_dir / 'export.stderr.log').stat().st_size,
-            'export_working_directory': str(checkout), 'omp_num_threads': 8}
+    # capture_process enforces the documented timeout and 16 MiB log limit,
+    # terminates and reaps on either, and retains whatever logs exist.
+    result = capture_process(argv, attempt_dir, EXPORT_TIMEOUT_SECONDS,
+                             cwd=Path(checkout), env=env)
+    result['export_working_directory'] = str(checkout)
+    result['omp_num_threads'] = 8
+    return result
 
 
 def build_manifest(profile, profile_sha, assets_sha, pylock_sha, config_key, config_sha,
@@ -161,7 +137,7 @@ def export_attempt(profile_path, schema_path, reference_path, checkout, weights,
     process = run_export(config_path, Path(checkout), output)
     result = {'status': 'EXPORT_FAILED_RETAINED_LOGS', 'recipe_status': recipe['status'],
               'export_process': process}
-    if process['returncode'] != 0:
+    if process['completion_reason'] != 'EXITED' or process['returncode'] != 0:
         return result
     pte_path = output / 'exported/llama3_2_1b_xnnpack.pte'
     if not pte_path.is_file():
@@ -176,7 +152,13 @@ def export_attempt(profile_path, schema_path, reference_path, checkout, weights,
         from forgesight.edge_artifact import inspect_artifact
         validation = inspect_artifact(pte_path, reference_draft, profile)
     except importlib.metadata.PackageNotFoundError:
-        validation = {'status': 'NOT_RUN_IN_THIS_ENV', 'method_execution': 'NOT_RUN'}
+        # The pinned ExecuTorch environment is unavailable, so the artifact was
+        # never actually verified. That is not a staged success: keep the logs,
+        # stage no manifest, and exit nonzero.
+        result['status'] = 'EXPORTED_VALIDATION_NOT_RUN'
+        result['artifact_validation'] = {'status': 'NOT_RUN_IN_THIS_ENV',
+                                         'method_execution': 'NOT_RUN'}
+        return result
     except Exception as error:
         result['status'] = 'EXPORT_FAILED_ARTIFACT_REJECTED'
         result['artifact_validation'] = {'status': 'FAILED_NOT_VERIFIED',

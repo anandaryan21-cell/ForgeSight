@@ -42,7 +42,8 @@ def terminate_process(process) -> None:
     process.wait()
 
 
-def capture_process(argv: list[str], output: Path, timeout: float) -> dict:
+def capture_process(argv: list[str], output: Path, timeout: float,
+                    cwd: Path | None = None, env: dict | None = None) -> dict:
     """Bound a real process and capture logs; this helper does not identify a model."""
     if not 0 < timeout <= 3600:
         raise ValueError("Timeout must be positive and at most one hour.")
@@ -52,6 +53,7 @@ def capture_process(argv: list[str], output: Path, timeout: float) -> dict:
     stdout_path, stderr_path = output / "stdout.log", output / "stderr.log"
     with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
         process = subprocess.Popen(argv, stdout=stdout, stderr=stderr, shell=False,
+                                   cwd=cwd, env=env,
                                    start_new_session=os.name == "posix")
         try:
             while process.poll() is None:
