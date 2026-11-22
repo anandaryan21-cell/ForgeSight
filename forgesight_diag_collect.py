@@ -185,8 +185,10 @@ def discover_saved_runs(args):
     """Find saved inspection records and small run JSONs in known run roots.
 
     Bounded: direct runs/ children of each directory under
-    ~/.local/share/forgesight plus the checkout's own runs/ directory;
-    newest records first, capped, JSON only, never images or bulk files.
+    ~/.local/share/forgesight, the checkout's own runs/ directory, and the
+    feature-audit space ~/forgesight-feature-audits/*/*/records plus
+    */advice (the layout observed on the actual device); newest records
+    first, capped, JSON only, never images or bulk files.
     """
     run_roots = []
     data_dir = Path.home() / ".local" / "share" / "forgesight"
@@ -202,13 +204,26 @@ def discover_saved_runs(args):
         for record in runs.glob("*/record.json"):
             if record.is_file():
                 records.append(record)
-    records = sorted(set(records), key=lambda p: p.stat().st_mtime, reverse=True)
-    extra_jsons = []
+    audit_space = Path.home() / "forgesight-feature-audits"
+    audit_records = []
+    audit_reports = []
+    if audit_space.is_dir():
+        audit_records = [path for path in
+                         audit_space.glob("*/*/records/*/result/record.json")
+                         if path.is_file()]
+        audit_reports = [path for path in
+                         audit_space.glob("*/*/advice/*/advice_report.json")
+                         if path.is_file()]
+    records = sorted(set(records) | set(audit_records),
+                     key=lambda p: p.stat().st_mtime, reverse=True)
+    extra_jsons = list(audit_reports)
     for record in records[:MAX_RECORDS]:
         for sibling in sorted(record.parent.glob("*.json")):
             if sibling != record and sibling.is_file():
                 extra_jsons.append(sibling)
     return {"run_roots": [str(root) for root in run_roots],
+            "audit_space": str(audit_space),
+            "audit_space_present": audit_space.is_dir(),
             "records": [str(record) for record in records[:MAX_RECORDS]],
             "records_found_total": len(records),
             "extra_jsons": [str(path) for path in extra_jsons[:MAX_EXTRA_JSON]]}

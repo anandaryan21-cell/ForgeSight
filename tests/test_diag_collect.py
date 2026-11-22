@@ -88,6 +88,28 @@ class DiagCollectDiscoveryTest(unittest.TestCase):
             self.assertTrue(any('run_a' in s for s in sources))
             self.assertTrue(any('run_b' in s for s in sources))
 
+    def test_audit_space_records_and_reports_are_discovered(self):
+        with tempfile.TemporaryDirectory() as workdir, tempfile.TemporaryDirectory() as home:
+            make_install(Path(home) / '.local/share/forgesight/llama_cpu_v1')
+            result_dir = (Path(home) / 'forgesight-feature-audits/main-x/composed-camera'
+                          / 'records/abc123/result')
+            result_dir.mkdir(parents=True)
+            (result_dir / 'record.json').write_text(json.dumps({'id': 'abc123'}))
+            advice_dir = Path(home) / 'forgesight-feature-audits/main-x/composed-camera/advice/abc123'
+            advice_dir.mkdir(parents=True)
+            (advice_dir / 'advice_report.json').write_text(json.dumps({'id': 'abc123'}))
+            result = self.run_collector(workdir, home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            bundle = self.bundle(workdir)
+            runs = json.loads((bundle / 'saved_runs_discovery.json').read_text())
+            self.assertEqual(len(runs['records']), 1)
+            self.assertIn('records/abc123/result/record.json', runs['records'][0])
+            self.assertEqual(len(runs['extra_jsons']), 1)
+            self.assertIn('advice_report.json', runs['extra_jsons'][0])
+            copied = json.loads((bundle / 'copied_reports.json').read_text())
+            self.assertTrue(copied['records'][0]['copied'])
+            self.assertTrue(copied['run_jsons'][0]['copied'])
+
     def test_unmarked_or_incomplete_install_is_not_selected(self):
         with tempfile.TemporaryDirectory() as workdir, tempfile.TemporaryDirectory() as home:
             make_install(Path(home) / '.local/share/forgesight/llama_cpu_v1', valid=False)
