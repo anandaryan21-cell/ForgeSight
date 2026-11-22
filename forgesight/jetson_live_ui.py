@@ -635,7 +635,9 @@ class LiveService:
         # The advisory contract is an explicit operator choice per request.
         # The defect-type profile only gates AVAILABILITY of the reviewed
         # A/B check contract; the record's contents never select the mode.
-        if advisory_mode not in ("composed", "vision_choice"):
+        # "auto" inspects the latest record and routes to the appropriate
+        # contract so the UI can present a single button.
+        if advisory_mode not in ("composed", "vision_choice", "auto"):
             raise ValueError("Unknown advisory mode.")
         if (advisory_mode == "vision_choice"
                 and not getattr(self.args, "defect_type_profile", None)):
@@ -661,6 +663,16 @@ class LiveService:
             # the chosen contract; they never switch it.
             from forgesight.assist_vision import vision_context
             assessment = record.get("assessment")
+            # Auto-routing: determine the correct contract from the record.
+            if advisory_mode == "auto":
+                has_profile = getattr(self.args, "defect_type_profile", None)
+                if (has_profile
+                        and isinstance(assessment, dict)
+                        and assessment.get("scope") == "PROVISIONAL_BENCHMARK_IMAGE"
+                        and vision_context(record) is not None):
+                    advisory_mode = "vision_choice"
+                else:
+                    advisory_mode = "composed"
             if advisory_mode == "composed" and assessment is not None:
                 raise ValueError(
                     "This inspection carries a provisional defect assessment, "

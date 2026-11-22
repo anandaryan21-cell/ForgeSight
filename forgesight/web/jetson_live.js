@@ -45,9 +45,8 @@ function updateButton() {
   // earlier report aside and starts a fresh attempt.
   byId('advice-request').disabled = locked || !eligible ||
     !['NOT_REQUESTED', 'ADVICE_UNAVAILABLE'].includes(adviceState?.status);
-  byId('advice-vision-request').hidden = !visionAdviceAvailable;
-  byId('advice-vision-help').hidden = !visionAdviceAvailable;
-  byId('advice-vision-request').disabled = byId('advice-request').disabled;
+  // The second advisory button has been removed; auto-routing is handled
+  // server-side when the UI sends mode "auto".
   byId('inspect').textContent = busy ? 'Inspection in progress…' : 'Capture & analyze';
   byId('diagnostic-submit').textContent = busy ? 'Inspection in progress…' : 'Analyze uploaded PNG';
   for (const form of ['capture-form', 'upload-form', 'review-form']) {
@@ -472,16 +471,9 @@ byId('upload-form').addEventListener('submit', event => {
 byId('advice-request').addEventListener('click', () => {
   if (byId('advice-request').disabled) return;
   byId('advice-status').textContent = 'Requesting on-device Llama advice…';
-  submitAction('advice-request', 'advice-status', '/api/advice', {method: 'POST'},
+  submitAction('advice-request', 'advice-status', '/api/advice',
+    {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode: 'auto'})},
     () => { byId('advice-status').textContent = 'Llama is generating through ExecuTorch…'; });
-});
-
-byId('advice-vision-request').addEventListener('click', () => {
-  if (byId('advice-vision-request').disabled) return;
-  byId('advice-status').textContent = 'Requesting a reviewed type-aware check…';
-  submitAction('advice-vision-request', 'advice-status', '/api/advice',
-    {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode: 'vision_choice'})},
-    () => { byId('advice-status').textContent = 'Llama is choosing a reviewed check…'; });
 });
 
 byId('review-form').addEventListener('submit', event => {
