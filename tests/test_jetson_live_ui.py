@@ -313,6 +313,11 @@ class LiveHttpTests(unittest.TestCase):
                           headers={"Origin": self.base, "Content-Type": "application/json"})
         self.assertEqual(urlopen(request).status, 202)
         self.assertEqual(self.service.requests[-1], ("advice", "vision_choice"))
+        body = json.dumps({"mode": "auto"}).encode()
+        request = Request(self.base + "/api/advice", method="POST", data=body,
+                          headers={"Origin": self.base, "Content-Type": "application/json"})
+        self.assertEqual(urlopen(request).status, 202)
+        self.assertEqual(self.service.requests[-1], ("advice", "auto"))
 
     def test_manual_review_route_requires_same_origin_and_bounded_json(self):
         self.assertIn(b'id="review-submit"', urlopen(self.base).read())

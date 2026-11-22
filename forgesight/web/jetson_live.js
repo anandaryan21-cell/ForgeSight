@@ -18,7 +18,6 @@ let historySignature = '';
 let reviewSignature = '';
 let cameraReady = false;
 let cameraRunning = false;
-let visionAdviceAvailable = false;
 let cameraControlPending = false;
 let busy = false;
 let currentLatest = null;
@@ -101,7 +100,6 @@ async function refreshState() {
   const epoch = commandEpoch;
   try {
     const state = await requestJSON('/api/state');
-    visionAdviceAvailable = state.vision_advice_available === true;
     // A state request begun before a user action must not undo its UI lock.
     if (epoch !== commandEpoch) return;
     connected = true;
