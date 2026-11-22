@@ -39,10 +39,15 @@ Operation contract (same discipline as the rest of the edge tooling):
 - ``preflight`` changes nothing and lists every blocker.
 - ``activate`` refuses to touch anything while any blocker exists, including
   a detected running operator app or advisory worker (the app owns the worker
-  as a child process; both must be stopped first). It backs up the live trio
-  with verified hashes before replacing anything, replaces via same-directory
-  temp files + ``os.replace`` + directory fsync, re-verifies the live chain,
-  and rolls back automatically if that post-swap verification fails.
+  as a child process; both must be stopped first) or any process whose
+  cmdline it cannot read - if it cannot prove the app is stopped, it fails
+  closed. It backs up the live trio with verified hashes before replacing
+  anything, replaces via same-directory temp files + ``os.replace`` +
+  directory fsync, and re-verifies the live chain. A failure before the
+  first replace reports FAILED_LIVE_UNCHANGED; a failure after it restores
+  the verified backup (FAILED_ROLLED_BACK_VERIFIED) or names manual recovery
+  with the backup and journal (FAILED_MANUAL_INTERVENTION). It never reports
+  "no changes" once a write may have happened.
 - ``rollback`` verifies the backup before restoring, preserves whatever is
   currently live under ``pre_rollback_live/`` (nothing is silently destroyed),
   and re-verifies the restored chain.
@@ -193,9 +198,10 @@ def scan_app_processes():
     """Best-effort /proc scan for a running operator app or advisory worker.
 
     Returns matching (pid, cmdline) rows plus a count of processes whose
-    cmdline was unreadable to this user (a root-owned process would be). An
-    unreadable process cannot be proven innocent, so activate treats
-    'unavailable/unreadable' honestly in its report; matching rows block.
+    cmdline was unreadable to this user (a root-owned process would be).
+    Matching rows block activation, and so does any unreadable cmdline: an
+    unreadable process cannot be proven innocent, so activation fails closed
+    rather than guessing.
     """
     result = {'matching': [], 'unreadable': 0, 'scan': 'procfs'}
     proc = Path('/proc')
@@ -261,7 +267,11 @@ def preflight(llama_root, candidate_dir):
         missing = [name for name in ALL_NAMES if not (model_dir / name).is_file()]
         if missing:
             blockers.append(f'Live model directory is missing files: {missing}')
-        else:
+        stale = sorted(path.name for path in model_dir.glob(TEMP_PREFIX + '*.tmp'))
+        if stale:
+            blockers.append(f'Stale staging temp files in the live directory: {stale}; '
+                            'a previous run was interrupted - inspect them before retrying')
+        if not missing and not stale:
             try:
                 live = verify_chain(*(model_dir / name for name in
                                       (PTE_NAME, PROFILE_NAME, EXPORT_NAME,
@@ -318,7 +328,8 @@ def preflight(llama_root, candidate_dir):
     if processes['scan'] != 'procfs' or processes['unreadable']:
         report['warnings'].append(
             f"Process scan is {processes['scan']} with {processes['unreadable']} unreadable "
-            'processes; the operator must still confirm the app is stopped.')
+            'processes; activation will refuse until the app is stopped and every process '
+            'cmdline is readable to the user running the tool.')
     if not blockers:
         report['status'] = 'PREFLIGHT_OK'
     return report
@@ -333,6 +344,11 @@ def _refuse_if_running(report):
             'running: ' + '; '.join(f"pid {row['pid']}" for row in processes['matching']))
     if processes['scan'] != 'procfs':
         raise StageError('Cannot confirm the app is stopped: no procfs on this host.')
+    if processes['unreadable']:
+        raise StageError(
+            f"Cannot prove the operator app/worker is stopped: {processes['unreadable']} "
+            'process cmdlines are unreadable to this user. Stop the app and rerun, or '
+            'rerun with read access to all processes (for example via sudo).')
 
 
 def _install(model_dir, source_dir, names):
@@ -368,13 +384,18 @@ def _restore_from_backup(model_dir, backup_dir, record, report, reason):
         verify_chain(*(Path(model_dir) / name for name in
                        (PTE_NAME, PROFILE_NAME, EXPORT_NAME, ASSETS_NAME, TOKENIZER_NAME)))
         report['status'] = 'FAILED_ROLLED_BACK_VERIFIED'
-        report['rollback_detail'] = ('Live trio restored from the verified backup and the '
+        report['rollback_detail'] = ('The live set was mixed or unverified after the failed '
+                                     'swap; it was restored from the verified backup and the '
                                      'restored chain passes verification.')
     except (StageError, OSError) as error:
         report['status'] = 'FAILED_MANUAL_INTERVENTION'
         report['rollback_detail'] = (
-            f'Automatic rollback did not complete cleanly: {error}. The verified backup is '
-            f'at {backup_dir}; restore {REPLACED_NAMES} from it by hand.')
+            f'Automatic rollback did not complete cleanly: {error}. THE LIVE SET MAY BE '
+            f'MIXED RIGHT NOW. Recover by hand: keep the app stopped, copy '
+            f'{REPLACED_NAMES} from the verified backup at {backup_dir} into {model_dir}, '
+            f'then rerun preflight against any candidate to prove the chain. The journal at '
+            f'{backup_dir}/activation_journal.json records where the swap stopped. Do not '
+            'start the app until the chain verifies.')
     return report
 
 
@@ -432,16 +453,32 @@ def activate(llama_root, candidate_dir, backup_parent, report_path):
                       'run preflight, then rollback from this backup directory.')},
             indent=2) + '\n')
 
-        # 2. Replace, then prove the new live chain; auto-rollback on failure.
-        _install(model_dir, candidate_dir, REPLACED_NAMES)
+        # 2. Replace, then prove the new live chain. From here a failure can
+        # leave a MIXED live set, so nothing in the handler may claim "no
+        # changes": it restores the verified backup, or names manual recovery.
         try:
+            _install(model_dir, candidate_dir, REPLACED_NAMES)
             report['live_chain'] = verify_chain(
                 *(model_dir / name for name in
                   (PTE_NAME, PROFILE_NAME, EXPORT_NAME, ASSETS_NAME, TOKENIZER_NAME)))
-        except StageError as error:
+        except Exception as error:
             journal_path.write_text(json.dumps(
-                {'state': 'POST_VERIFY_FAILED', 'error': str(error)}, indent=2) + '\n')
-            report = _restore_from_backup(model_dir, backup_dir, record, report, str(error))
+                {'state': 'SWAP_FAILED', 'error': f'{type(error).__name__}: {error}'},
+                indent=2) + '\n')
+            live_now = _hashes(model_dir, REPLACED_NAMES)
+            if all(live_now[name]['sha256'] == record['files'][name]['sha256']
+                   for name in REPLACED_NAMES):
+                # The failure happened before the first replace: the live trio
+                # still equals the verified backup of the original chain.
+                report['status'] = 'FAILED_LIVE_UNCHANGED'
+                report['error'] = f'{type(error).__name__}: {error}'
+                report['detail'] = ('The swap failed before any live file was replaced; '
+                                    'the live trio still matches the verified backup of '
+                                    'the original chain. Fix the cause and retry with a '
+                                    'fresh report path.')
+            else:
+                report = _restore_from_backup(model_dir, backup_dir, record, report,
+                                              f'{type(error).__name__}: {error}')
             _write_report(report_path, report)
             return report
         journal_path.write_text(json.dumps({'state': 'ACTIVATED', 'finished_utc': _utc()},
@@ -452,10 +489,11 @@ def activate(llama_root, candidate_dir, backup_parent, report_path):
                           'advisory remains the authoritative device proof; this script '
                           'proves only the hash chain swap.')
     except (StageError, OSError) as error:
-        report['status'] = 'BLOCKED' if report['status'] == 'BLOCKED' else report['status']
+        # Reachable only before the journal/install phase: the swap handler
+        # above owns every failure after the first possible write.
+        report['status'] = 'BLOCKED'
         report['error'] = str(error)
-        if report['status'] == 'BLOCKED':
-            report['detail'] = 'No live file was changed.'
+        report['detail'] = 'No live file was changed.'
     _write_report(report_path, report)
     return report
 
@@ -483,9 +521,9 @@ def rollback(llama_root, backup_dir, report_path):
             _check_fingerprint(backup_dir / name, expected, 'backup file')
         _refuse_if_running(report)
 
-        live_now = _hashes(model_dir, REPLACED_NAMES)
-        report['live_before'] = live_now
-        if all(live_now[name]['sha256'] == recorded[name]['sha256']
+        live_before = _hashes(model_dir, REPLACED_NAMES)
+        report['live_before'] = live_before
+        if all(live_before[name]['sha256'] == recorded[name]['sha256']
                for name in REPLACED_NAMES):
             report['status'] = 'ALREADY_MATCHES_BACKUP'
             report['detail'] = 'Live trio already equals the backup; nothing was changed.'
@@ -497,21 +535,44 @@ def rollback(llama_root, backup_dir, report_path):
                 raise StageError(f'Pre-rollback preservation directory exists: {preserved}')
             for name in REPLACED_NAMES:
                 _copy_verified(model_dir / name, preserved / name)
-            _install(model_dir, backup_dir, REPLACED_NAMES)
             report['preserved_live_to'] = str(preserved)
+            # Same honesty rule as activate: once a replace may have happened,
+            # the report must never imply the live set is simply unchanged.
             try:
+                _install(model_dir, backup_dir, REPLACED_NAMES)
                 report['live_chain'] = verify_chain(
                     *(model_dir / name for name in
                       (PTE_NAME, PROFILE_NAME, EXPORT_NAME, ASSETS_NAME, TOKENIZER_NAME)))
                 report['status'] = 'ROLLED_BACK_VERIFIED'
                 report['next'] = ('Start the operator app; its worker re-verifies the '
                                   'restored chain at startup.')
-            except StageError as error:
-                report['status'] = 'FAILED_MANUAL_INTERVENTION'
-                report['error'] = (f'The trio was restored but the chain does not verify; '
-                                   f'assets/tokenizer may have drifted independently: {error}')
+            except Exception as error:
+                live_now = _hashes(model_dir, REPLACED_NAMES)
+                if all(live_now[name]['sha256'] == recorded[name]['sha256']
+                       for name in REPLACED_NAMES):
+                    report['status'] = 'FAILED_MANUAL_INTERVENTION'
+                    report['error'] = (f'The trio was restored from the backup but the chain '
+                                       f'does not verify; assets/tokenizer may have drifted '
+                                       f'independently: {type(error).__name__}: {error}')
+                elif all(live_now[name]['sha256'] == live_before[name]['sha256']
+                         for name in REPLACED_NAMES):
+                    report['status'] = 'FAILED_LIVE_UNCHANGED'
+                    report['error'] = f'{type(error).__name__}: {error}'
+                    report['detail'] = ('Rollback failed before any live file was replaced; '
+                                        'the live set is unchanged, and a verified copy is '
+                                        f'also preserved at {preserved}. Fix the cause and '
+                                        'retry with a fresh report path.')
+                else:
+                    report['status'] = 'FAILED_MANUAL_INTERVENTION'
+                    report['error'] = (
+                        f'Rollback failed mid-install: {type(error).__name__}: {error}. '
+                        'THE LIVE SET MAY BE MIXED RIGHT NOW. Recover by hand: choose one '
+                        f'coherent chain - the verified backup at {backup_dir} or the '
+                        f'preserved previous live set at {preserved} - copy its '
+                        f'{REPLACED_NAMES} into {model_dir}, then run preflight. Keep the '
+                        'app stopped until the chain verifies.')
     except (StageError, OSError) as error:
-        report['status'] = 'BLOCKED' if report['status'] == 'BLOCKED' else report['status']
+        report['status'] = 'BLOCKED'
         report['error'] = str(error)
     _write_report(report_path, report)
     return report

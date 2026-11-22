@@ -28,7 +28,10 @@ mixed-set window during the three `os.replace` calls is then unobserved.
   the actual new PTE from a retained export attempt. A profile-only or
   manifest-only update makes the device refuse service by design.
 - Operator app stopped (Ctrl+C on its terminal). Activation refuses while
-  the app or worker process is detected.
+  the app or worker process is detected, and also refuses when it cannot
+  read every process cmdline: run the tool as the same user that runs the
+  app (or via sudo), so the scan can prove the app is stopped. An
+  unreadable process cannot be proven innocent, so the tool fails closed.
 
 ## Stage the candidate (PC to Jetson)
 
@@ -104,6 +107,24 @@ Rollback verifies the backup before restoring and preserves whatever is
 currently live under `pre_rollback_live/` inside the backup directory, so no
 state is silently destroyed. `ROLLED_BACK_VERIFIED` means the old chain is
 live and verified; restart the app afterwards.
+
+## Failure outcomes
+
+Every failure is reported with an explicit, truthful state; the tool never
+claims "no changes" once a write may have happened:
+
+- `BLOCKED` - a preflight or safety refusal. No live file was changed.
+- `FAILED_LIVE_UNCHANGED` - the swap failed before the first file was
+  replaced; the live trio still matches the verified backup of the original
+  chain. Fix the cause and retry with a fresh report path.
+- `FAILED_ROLLED_BACK_VERIFIED` - the swap failed after replacing files, so
+  the live set was mixed; the verified backup was restored automatically and
+  the restored chain passes verification.
+- `FAILED_MANUAL_INTERVENTION` - the automatic restore did not complete.
+  The live set may be mixed right now. Keep the app stopped and recover by
+  hand: the report names the verified backup directory and (for rollback)
+  the preserved previous live set; copy one coherent trio into `model/`,
+  then run preflight. Do not start the app until the chain verifies.
 
 If a crash interrupts activation, the backup directory's
 `activation_journal.json` says where it stopped; run preflight, then

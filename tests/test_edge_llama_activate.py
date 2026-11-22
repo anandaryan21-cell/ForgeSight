@@ -269,6 +269,103 @@ class ActivateTests(unittest.TestCase):
             model_dir = llama_root / act.MODEL_DIR
             self.assertEqual(act.sha256_file(model_dir / act.PTE_NAME), _sha(new['pte']))
 
+    def test_mid_install_failure_after_first_replace_restores_old_chain(self):
+        with TemporaryDirectory() as tmp:
+            llama_root, candidate, old, new = make_world(tmp)
+            model_dir = llama_root / act.MODEL_DIR
+            real_replace = os.replace
+            calls = {'n': 0}
+
+            def flaky_replace(src, dst):
+                calls['n'] += 1
+                if calls['n'] == 2:  # first swap replace done, second fails: mixed set
+                    raise OSError('simulated replace failure after the first swap')
+                return real_replace(src, dst)
+
+            with patch.object(act, 'scan_app_processes', return_value=QUIET_SCAN), \
+                    patch.object(act.os, 'replace', side_effect=flaky_replace):
+                report = act.activate(llama_root, candidate, Path(tmp) / 'backups',
+                                      Path(tmp) / 'activate.json')
+            self.assertEqual(report['status'], 'FAILED_ROLLED_BACK_VERIFIED')
+            self.assertIn('simulated replace failure', report['rollback_reason'])
+            self.assertNotIn('No live file was changed', json.dumps(report))
+            for name in act.REPLACED_NAMES:
+                self.assertEqual(act.sha256_file(model_dir / name),
+                                 act.sha256_file(Path(report['backup_dir']) / name))
+            journal = json.loads((Path(report['backup_dir'])
+                                  / 'activation_journal.json').read_text())
+            self.assertEqual(journal['state'], 'SWAP_FAILED')
+            record = json.loads((Path(report['backup_dir']) / 'backup.json').read_text())
+            self.assertEqual(record['files'][act.PTE_NAME]['sha256'], _sha(old['pte']))
+
+    def test_mid_install_failure_with_restore_failure_names_mixed_set(self):
+        with TemporaryDirectory() as tmp:
+            llama_root, candidate, old, new = make_world(tmp)
+            model_dir = llama_root / act.MODEL_DIR
+            real_replace = os.replace
+            calls = {'n': 0}
+
+            def always_failing_replace(src, dst):
+                calls['n'] += 1
+                if calls['n'] >= 2:  # swap replace 2 and every restore replace fail
+                    raise OSError('simulated persistent replace failure')
+                return real_replace(src, dst)
+
+            with patch.object(act, 'scan_app_processes', return_value=QUIET_SCAN), \
+                    patch.object(act.os, 'replace', side_effect=always_failing_replace):
+                report = act.activate(llama_root, candidate, Path(tmp) / 'backups',
+                                      Path(tmp) / 'activate.json')
+            self.assertEqual(report['status'], 'FAILED_MANUAL_INTERVENTION')
+            detail = report['rollback_detail']
+            self.assertIn('MIXED', detail)
+            self.assertIn(report['backup_dir'], detail)
+            self.assertIn('activation_journal.json', detail)
+            self.assertNotIn('No live file was changed', json.dumps(report))
+            # The fixture truly left the boundary state: PTE new, profile old.
+            self.assertEqual(act.sha256_file(model_dir / act.PTE_NAME), _sha(new['pte']))
+            self.assertEqual(act.sha256_file(model_dir / act.PROFILE_NAME),
+                             act.sha256_file(Path(report['backup_dir']) / act.PROFILE_NAME))
+            # The verified backup survives for manual recovery.
+            record = json.loads((Path(report['backup_dir']) / 'backup.json').read_text())
+            for name in act.REPLACED_NAMES:
+                self.assertEqual(act.sha256_file(Path(report['backup_dir']) / name),
+                                 record['files'][name]['sha256'])
+
+    def test_copy_phase_failure_before_any_replace_reports_live_unchanged(self):
+        with TemporaryDirectory() as tmp:
+            llama_root, candidate, old, _ = make_world(tmp)
+            model_dir = llama_root / act.MODEL_DIR
+            real_copyfile = act.shutil.copyfile
+
+            def flaky_copyfile(src, dst):
+                if Path(dst).name.startswith(act.TEMP_PREFIX):
+                    raise OSError('simulated copy failure before any replace')
+                return real_copyfile(src, dst)
+
+            with patch.object(act, 'scan_app_processes', return_value=QUIET_SCAN), \
+                    patch.object(act.shutil, 'copyfile', side_effect=flaky_copyfile):
+                report = act.activate(llama_root, candidate, Path(tmp) / 'backups',
+                                      Path(tmp) / 'activate.json')
+            self.assertEqual(report['status'], 'FAILED_LIVE_UNCHANGED')
+            self.assertIn('before any live file was replaced', report['detail'])
+            self.assertEqual(act.sha256_file(model_dir / act.PTE_NAME), _sha(old['pte']))
+            self.assertFalse(any((model_dir).glob(act.TEMP_PREFIX + '*')))
+
+    def test_unreadable_process_scan_blocks_before_any_change(self):
+        with TemporaryDirectory() as tmp:
+            llama_root, candidate, _, _ = make_world(tmp)
+            model_dir = llama_root / act.MODEL_DIR
+            before = act._hashes(model_dir, act.ALL_NAMES)
+            unreadable = {'matching': [], 'unreadable': 3, 'scan': 'procfs'}
+            with patch.object(act, 'scan_app_processes', return_value=unreadable):
+                report = act.activate(llama_root, candidate, Path(tmp) / 'backups',
+                                      Path(tmp) / 'activate.json')
+            self.assertEqual(report['status'], 'BLOCKED')
+            self.assertIn('unreadable', report['error'])
+            self.assertEqual(act._hashes(model_dir, act.ALL_NAMES), before)
+            self.assertFalse((Path(tmp) / 'backups').exists()
+                             and any((Path(tmp) / 'backups').iterdir()))
+
     def test_post_swap_verify_failure_rolls_back_automatically(self):
         with TemporaryDirectory() as tmp:
             llama_root, candidate, old, _ = make_world(tmp)
@@ -325,6 +422,35 @@ class RollbackTests(unittest.TestCase):
             self.assertEqual(first['status'], 'ROLLED_BACK_VERIFIED')
             self.assertEqual(second['status'], 'ALREADY_MATCHES_BACKUP')
             self.assertEqual(act.sha256_file(model_dir / act.PTE_NAME), _sha(old['pte']))
+
+    def test_rollback_mid_install_failure_names_both_coherent_sets(self):
+        with TemporaryDirectory() as tmp:
+            llama_root, backup_dir, old, new = self._activated(tmp)
+            model_dir = llama_root / act.MODEL_DIR
+            real_replace = os.replace
+            calls = {'n': 0}
+
+            def flaky_replace(src, dst):
+                calls['n'] += 1
+                if calls['n'] == 2:  # first restore replace done, second fails
+                    raise OSError('simulated rollback replace failure')
+                return real_replace(src, dst)
+
+            with patch.object(act, 'scan_app_processes', return_value=QUIET_SCAN), \
+                    patch.object(act.os, 'replace', side_effect=flaky_replace):
+                report = act.rollback(llama_root, backup_dir, Path(tmp) / 'rollback.json')
+            self.assertEqual(report['status'], 'FAILED_MANUAL_INTERVENTION')
+            self.assertIn('MIXED', report['error'])
+            self.assertIn('pre_rollback_live', report['error'])
+            self.assertNotIn('No live file was changed', json.dumps(report))
+            # Boundary state is real: PTE restored from backup, profile still new.
+            self.assertEqual(act.sha256_file(model_dir / act.PTE_NAME), _sha(old['pte']))
+            self.assertEqual(act.sha256_file(model_dir / act.PROFILE_NAME),
+                             act.sha256_file(Path(report['preserved_live_to'])
+                                             / act.PROFILE_NAME))
+            # Both coherent recovery sets are intact.
+            self.assertEqual(act.sha256_file(Path(report['preserved_live_to']) / act.PTE_NAME),
+                             _sha(new['pte']))
 
     def test_tampered_backup_blocks_without_touching_live(self):
         with TemporaryDirectory() as tmp:
