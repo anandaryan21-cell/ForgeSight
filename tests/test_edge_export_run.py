@@ -99,6 +99,10 @@ class AttemptTests(unittest.TestCase):
             output = Path(tmp) / 'attempt_02'
 
             def fake_export(config_path, checkout_dir, attempt_dir):
+                # The subprocess runs with cwd=checkout; a relative --config
+                # would resolve against the checkout, not the repo.
+                if not Path(config_path).is_absolute():
+                    raise AssertionError('config path must be absolute')
                 pte = attempt_dir / 'exported/llama3_2_1b_xnnpack.pte'
                 pte.parent.mkdir(parents=True)
                 pte.write_bytes(b'\x00\x00\x00\x00ET12' + b'fake pte bytes for staging test')

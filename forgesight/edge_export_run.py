@@ -149,13 +149,15 @@ def export_attempt(profile_path, schema_path, reference_path, checkout, weights,
     profile = json.loads(Path(profile_path).read_text())
     reference = json.loads(Path(reference_path).read_text())
     assets = json.loads(Path(assets_path).read_text())
-    blockers = readiness(profile, reference, Path(checkout), Path(weights), assets, Path(output))
+    # Resolve before anything runs: the export subprocess executes with the
+    # pinned checkout as cwd, so a relative config path would not resolve.
+    output = Path(output).resolve()
+    blockers = readiness(profile, reference, Path(checkout), Path(weights), assets, output)
     if blockers:
         return {'status': 'BLOCKED_NOT_RUN', 'blockers': blockers}
-    output = Path(output)
     recipe = create_recipe(profile, json.loads(Path(schema_path).read_text()),
                            Path(checkout), Path(weights), output)
-    config_path = output / 'export_config.yaml'
+    config_path = (output / 'export_config.yaml').resolve()
     process = run_export(config_path, Path(checkout), output)
     result = {'status': 'EXPORT_FAILED_RETAINED_LOGS', 'recipe_status': recipe['status'],
               'export_process': process}
