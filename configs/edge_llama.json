@@ -13,7 +13,7 @@
   "quantization": "8da4w",
   "group_size": 128,
   "embedding_quantize": "4,32",
-  "max_seq_length": 128,
+  "max_seq_length": 256,
   "max_context_length": 512,
   "model_class": "llama3_2",
   "source_files": [

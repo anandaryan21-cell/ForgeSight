@@ -42,7 +42,8 @@ def terminate_process(process) -> None:
     process.wait()
 
 
-def capture_process(argv: list[str], output: Path, timeout: float) -> dict:
+def capture_process(argv: list[str], output: Path, timeout: float,
+                    cwd: Path | None = None, env: dict | None = None) -> dict:
     """Bound a real process and capture logs; this helper does not identify a model."""
     if not 0 < timeout <= 3600:
         raise ValueError("Timeout must be positive and at most one hour.")
@@ -52,6 +53,7 @@ def capture_process(argv: list[str], output: Path, timeout: float) -> dict:
     stdout_path, stderr_path = output / "stdout.log", output / "stderr.log"
     with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
         process = subprocess.Popen(argv, stdout=stdout, stderr=stderr, shell=False,
+                                   cwd=cwd, env=env,
                                    start_new_session=os.name == "posix")
         try:
             while process.poll() is None:
@@ -74,6 +76,10 @@ def capture_process(argv: list[str], output: Path, timeout: float) -> dict:
         finally:
             if process.poll() is None:
                 terminate_process(process)
+    # Final check after reap: a fast writer can exit 0 between polls having
+    # already crossed the limit; classify honestly rather than as EXITED.
+    if reason == "EXITED" and stdout_path.stat().st_size + stderr_path.stat().st_size > 16 * 1024 * 1024:
+        reason = "OUTPUT_LIMIT"
     return {"argv": argv, "returncode": process.returncode, "completion_reason": reason,
             "process_wall_seconds": time.monotonic() - started,
             "sampled_peak_rss_kib": peak_rss, "rss_sampling_interval_seconds": 0.05,
