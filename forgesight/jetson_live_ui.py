@@ -664,13 +664,18 @@ class LiveService:
             # Auto-routing: determine the correct contract from the record.
             if advisory_mode == "auto":
                 has_profile = getattr(self.args, "defect_type_profile", None)
-                if (has_profile
+                if assessment is None:
+                    advisory_mode = "composed"
+                elif (has_profile
                         and isinstance(assessment, dict)
                         and assessment.get("scope") == "PROVISIONAL_BENCHMARK_IMAGE"
                         and vision_context(record) is not None):
                     advisory_mode = "vision_choice"
                 else:
-                    advisory_mode = "composed"
+                    raise ValueError(
+                        "Automatic advice requires a supported benchmark assessment "
+                        "and a configured defect-type profile. Analyze a new image "
+                        "with a supported profile.")
             if advisory_mode == "composed" and assessment is not None:
                 raise ValueError(
                     "This inspection carries a provisional defect assessment, "
