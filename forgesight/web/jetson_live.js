@@ -18,7 +18,6 @@ let historySignature = '';
 let reviewSignature = '';
 let cameraReady = false;
 let cameraRunning = false;
-let visionAdviceAvailable = false;
 let groundedAutoAdvice = false;
 let cameraControlPending = false;
 let busy = false;
@@ -47,9 +46,8 @@ function updateButton() {
   byId('advice-request').hidden = groundedAutoAdvice;
   byId('advice-request').disabled = groundedAutoAdvice || locked || !eligible ||
     !['NOT_REQUESTED', 'ADVICE_UNAVAILABLE'].includes(adviceState?.status);
-  byId('advice-vision-request').hidden = groundedAutoAdvice || !visionAdviceAvailable;
-  byId('advice-vision-help').hidden = groundedAutoAdvice || !visionAdviceAvailable;
-  byId('advice-vision-request').disabled = byId('advice-request').disabled;
+  // The second advisory button has been removed; auto-routing is handled
+  // server-side when the UI sends mode "auto".
   byId('inspect').textContent = busy ? 'Inspection in progress…' : 'Capture & analyze';
   byId('diagnostic-submit').textContent = busy ? 'Inspection in progress…' : 'Analyze uploaded PNG';
   for (const form of ['capture-form', 'upload-form', 'review-form']) {
@@ -104,7 +102,6 @@ async function refreshState() {
   const epoch = commandEpoch;
   try {
     const state = await requestJSON('/api/state');
-    visionAdviceAvailable = state.vision_advice_available === true;
     groundedAutoAdvice = state.grounded_auto_advice === true;
     // A state request begun before a user action must not undo its UI lock.
     if (epoch !== commandEpoch) return;
@@ -236,11 +233,18 @@ function renderAdvice(advice) {
     ? 'Llama-selected check · human review required.'
     : labels[status] || 'Llama advice status is unknown.';
   const runtime = advice?.llama_runtime === 'PERSISTENT_WORKER'
-    ? 'Warm worker: the model stays loaded between notes.'
+    ? 'This request used the warm Llama worker.'
+    : advice?.llama_runtime === 'NOT_REQUESTED'
+    ? 'No Llama generation was requested; a checklist may be shown.'
+    : advice?.llama_runtime === 'PERSISTENT_WORKER_UNAVAILABLE'
+    ? 'The warm Llama request was unavailable; a checklist may be shown.'
     : (advice?.llama_runtime || '').includes('COLD')
     ? 'Cold process: the model loads for each note.' : 'No runtime mode reported.';
   byId('advice-runtime').textContent = runtime + (advice?.advice_worker_boot_error
-    ? ' The persistent worker did not start; the slower cold path is available.' : '');
+    ? ' The persistent worker did not start; the slower cold path is available.' : '') +
+    (typeof advice?.advice_worker_available_now === 'boolean'
+      ? (advice.advice_worker_available_now ? ' Worker now: ready.' : ' Worker now: unavailable.')
+      : '');
   const note = advice?.advisory?.note;
   byId('advice-note').hidden = !note ||
     !['GENERATED_REQUIRES_HUMAN_REVIEW', 'LLAMA_ADVICE', 'CHECKLIST_FALLBACK'].includes(status);
@@ -481,16 +485,9 @@ byId('upload-form').addEventListener('submit', event => {
 byId('advice-request').addEventListener('click', () => {
   if (byId('advice-request').disabled) return;
   byId('advice-status').textContent = 'Requesting on-device Llama advice…';
-  submitAction('advice-request', 'advice-status', '/api/advice', {method: 'POST'},
+  submitAction('advice-request', 'advice-status', '/api/advice',
+    {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode: 'auto'})},
     () => { byId('advice-status').textContent = 'Llama is generating through ExecuTorch…'; });
-});
-
-byId('advice-vision-request').addEventListener('click', () => {
-  if (byId('advice-vision-request').disabled) return;
-  byId('advice-status').textContent = 'Requesting a reviewed type-aware check…';
-  submitAction('advice-vision-request', 'advice-status', '/api/advice',
-    {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode: 'vision_choice'})},
-    () => { byId('advice-status').textContent = 'Llama is choosing a reviewed check…'; });
 });
 
 byId('review-form').addEventListener('submit', event => {

@@ -356,7 +356,8 @@ class LiveService:
             from forgesight.grounded_live import GroundedLive
             self.grounded_advice = GroundedLive(
                 self.advice_queue, self.advice_root / "grounded",
-                args.llama_worker_socket, args.llama_timeout_seconds)
+                args.llama_worker_socket, args.llama_timeout_seconds,
+                worker_unhealthy=self._respawn_advice_worker, llama_root=args.llama_root)
         self.llama_ready = (args.guidance.is_file()
                             and (args.llama_root / "venv/bin/python").is_file()
                             and (args.llama_root / "model/llama3_2_1b_xnnpack.pte").is_file())
@@ -642,10 +643,10 @@ class LiveService:
     def request_advice(self, advisory_mode="composed"):
         if getattr(self, "grounded_advice", None) is not None:
             raise ValueError("This station starts advice automatically after an inspection.")
-        # The advisory contract is an explicit operator choice per request.
-        # The defect-type profile only gates AVAILABILITY of the reviewed
-        # A/B check contract; the record's contents never select the mode.
-        if advisory_mode not in ("composed", "vision_choice"):
+        # The UI's single button requests "auto". Resolve it only from the
+        # saved assessment and enabled profile, then validate the chosen
+        # contract below before queuing any advisory work.
+        if advisory_mode not in ("composed", "vision_choice", "auto"):
             raise ValueError("Unknown advisory mode.")
         if (advisory_mode == "vision_choice"
                 and not getattr(self.args, "defect_type_profile", None)):
@@ -671,6 +672,21 @@ class LiveService:
             # the chosen contract; they never switch it.
             from forgesight.assist_vision import vision_context
             assessment = record.get("assessment")
+            # Auto-routing: determine the correct contract from the record.
+            if advisory_mode == "auto":
+                has_profile = getattr(self.args, "defect_type_profile", None)
+                if assessment is None:
+                    advisory_mode = "composed"
+                elif (has_profile
+                        and isinstance(assessment, dict)
+                        and assessment.get("scope") == "PROVISIONAL_BENCHMARK_IMAGE"
+                        and vision_context(record) is not None):
+                    advisory_mode = "vision_choice"
+                else:
+                    raise ValueError(
+                        "Automatic advice requires a supported benchmark assessment "
+                        "and a configured defect-type profile. Analyze a new image "
+                        "with a supported profile.")
             if advisory_mode == "composed" and assessment is not None:
                 raise ValueError(
                     "This inspection carries a provisional defect assessment, "
@@ -728,9 +744,8 @@ class LiveService:
                        # time count against the shared budget too.
                        "--request-deadline-monotonic",
                        str(time.monotonic() + self.args.llama_timeout_seconds + 45)]
-            # The operator's explicit per-request choice is passed through
-            # verbatim; the contract itself still refuses an invalid
-            # assessment in vision_choice and an assessed record in composed.
+            # Pass the resolved contract to the controller; it rechecks the
+            # evidence and refuses an invalid assessment before generation.
             command += ["--advisory-mode", advisory_mode]
             if getattr(self.args, "llama_worker_socket", None) is not None:
                 if self.advice_worker is not None and self.advice_worker.poll() is None:
@@ -1138,7 +1153,8 @@ class LiveService:
                        part_id, latest.get("error"))
 
     def _grounded_worker_available(self):
-        return self.advice_worker is not None and self.advice_worker.poll() is None
+        return (not getattr(self, "advice_worker_respawning", False)
+                and self.advice_worker is not None and self.advice_worker.poll() is None)
 
     def _grounded_worker_ready(self):
         if self._grounded_worker_available():

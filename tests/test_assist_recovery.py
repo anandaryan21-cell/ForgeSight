@@ -622,9 +622,7 @@ class UiRecoveryTests(unittest.TestCase):
 
 
 class AdvisoryModeSelectionTests(unittest.TestCase):
-    """The advisory contract is an explicit operator choice per request: the
-    defect-type profile only gates availability of the reviewed A/B check
-    contract, and the record's contents never select the mode."""
+    """Auto-routing selects only between the two validated advisory contracts."""
 
     def service(self, profile, record=None):
         from forgesight.jetson_live_ui import LiveService
@@ -682,6 +680,34 @@ class AdvisoryModeSelectionTests(unittest.TestCase):
     def test_default_request_is_explicitly_composed(self):
         command = self.command_for(profile="configs/defect_type_mvtec_four_v1.json")
         self.assertEqual(command[command.index("--advisory-mode") + 1], "composed")
+
+    def test_auto_routes_unassessed_record_to_composed(self):
+        command = self.command_for(profile=None, mode="auto")
+        self.assertEqual(command[command.index("--advisory-mode") + 1], "composed")
+
+    def test_auto_routes_valid_assessment_to_reviewed_choice(self):
+        command = self.command_for(profile="configs/defect_type_mvtec_four_v1.json",
+                                   mode="auto", record=self.assessed_record())
+        self.assertEqual(command[command.index("--advisory-mode") + 1], "vision_choice")
+
+    def test_auto_routes_unassessed_record_with_profile_to_composed(self):
+        command = self.command_for(profile="configs/defect_type_mvtec_four_v1.json",
+                                   mode="auto")
+        self.assertEqual(command[command.index("--advisory-mode") + 1], "composed")
+
+    def test_auto_refusal_does_not_offer_a_removed_button(self):
+        for profile, unsupported in ((None, False),
+                                     ("configs/defect_type_mvtec_four_v1.json", True)):
+            with self.subTest(profile=profile):
+                record = self.assessed_record()
+                if unsupported:
+                    record["assessment"].pop("severity")
+                service = self.service(profile, record)
+                try:
+                    with self.assertRaisesRegex(ValueError, "Automatic advice requires"):
+                        service.request_advice("auto")
+                finally:
+                    service.advice_queue.close()
 
     def test_operator_can_choose_vision_choice_when_profile_loaded(self):
         command = self.command_for(profile="configs/defect_type_mvtec_four_v1.json",

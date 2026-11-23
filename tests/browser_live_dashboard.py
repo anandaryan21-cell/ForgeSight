@@ -233,27 +233,30 @@ class DashboardBrowserTests(unittest.TestCase):
             'Check the highlighted line under angled light. [E1][G3]')
         expect(self.page.locator('#grade')).to_have_text('REJECT')
 
-    def test_type_aware_check_is_an_explicit_operator_choice(self):
-        # Hidden without the profile-gated availability flag from the server.
-        expect(self.page.locator('#advice-vision-request')).to_be_hidden()
-        self.state['vision_advice_available'] = True
-        self.refresh()
-        button = self.page.locator('#advice-vision-request')
+    def test_advice_button_is_single_and_requests_server_auto_routing(self):
+        expect(self.page.locator('#advice-vision-request')).to_have_count(0)
+        button = self.page.locator('#advice-request')
         expect(button).to_be_visible()
         expect(button).to_be_enabled()
-        # The composed default posts no mode; the operator's A/B choice posts
-        # its mode explicitly. Neither reads the record to pick a contract.
         self.page.locator('#advice-request').click()
         self.assertEqual(len(self.posts), 1)
         path, body, _ = self.posts[0]
         self.assertEqual(path, '/api/advice')
-        self.assertFalse(body)
-        self.posts.clear()
-        button.click()
-        self.assertEqual(len(self.posts), 1)
-        path, body, _ = self.posts[0]
-        self.assertEqual(path, '/api/advice')
-        self.assertEqual(json.loads(body), {'mode': 'vision_choice'})
+        self.assertEqual(json.loads(body), {'mode': 'auto'})
+
+    def test_automatic_advice_hides_manual_button_and_preserves_recorded_runtime(self):
+        self.state['grounded_auto_advice'] = True
+        self.state['advice'] = dict(status='LLAMA_ADVICE',
+                                   advisory=dict(note='Inspect the highlighted surface.'),
+                                   llama_runtime='PERSISTENT_WORKER',
+                                   advice_worker_available_now=False)
+        self.refresh()
+        expect(self.page.locator('#advice-request')).to_be_hidden()
+        expect(self.page.locator('#advice-vision-request')).to_have_count(0)
+        expect(self.page.locator('#advice-note')).to_have_text('Inspect the highlighted surface.')
+        expect(self.page.locator('#advice-runtime')).to_contain_text('This request used the warm')
+        expect(self.page.locator('#advice-runtime')).to_contain_text('Worker now: unavailable.')
+        self.assertEqual(self.posts, [])
 
     def test_image_failure_has_placeholder_and_retains_grade(self):
         self.bad_media.add('/api/inspection/fixture-new/overlay.png')

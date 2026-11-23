@@ -53,6 +53,10 @@ class GroundedAdviceTests(unittest.TestCase):
         approved = self.rules["checks"]["scratch"][1]
         reply = {
             "status": "GENERATED_BY_PERSISTENT_WORKER",
+            "worker_mode": "PERSISTENT_PROCESS",
+            "worker_started_utc": "2026-11-24T00:00:00Z",
+            "runtime_evidence": {"artifact": {"sha256": "a" * 64},
+                                 "tokenizer": {"sha256": "b" * 64}},
             "prompt_token_count": 91, "generate_ms": 1100,
             "generated_text": approved + "<|eot_id|>",
         }
@@ -60,6 +64,8 @@ class GroundedAdviceTests(unittest.TestCase):
         result = advise(row, self.rules, Path("test.sock"), 8)
         self.assertEqual(result["status"], "LLAMA_ADVICE")
         self.assertEqual(result["advice"], notes[normalized(approved)])
+        self.assertEqual(result["llama_runtime_mode"], "PERSISTENT_WORKER")
+        self.assertEqual(result["worker"]["model_sha256"], "a" * 64)
         reply["generated_text"] = (
             f"The best first inspection check is:\n\n**{approved}**\n"
             "The part is safe to release."
@@ -75,10 +81,50 @@ class GroundedAdviceTests(unittest.TestCase):
     def test_timeout_and_failed_inspection(self, run_worker):
         run_worker.side_effect = TimeoutError("test timeout")
         result = advise(self.record, self.rules, Path("test.sock"), 8)
-        self.assertEqual(result["fallback_reason"], "WORKER_UNAVAILABLE")
+        self.assertTrue(result.get("persistent_worker_unhealthy"))
         run_worker.reset_mock()
         row = deepcopy(self.record)
         row["status"] = "FAILED"
         result = advise(row, self.rules, Path("test.sock"), 8)
         self.assertEqual(result["status"], "INSPECTION_WITHHELD")
         run_worker.assert_not_called()
+
+    @patch("forgesight.grounded_advice.assist_edge_worker.request")
+    def test_matching_text_without_worker_evidence_is_not_llama_advice(self, run_worker):
+        row = self.assessed("scratch", "annular face")
+        run_worker.return_value = {
+            "status": "GENERATED_BY_PERSISTENT_WORKER", "prompt_token_count": 90,
+            "generate_ms": 1000, "generated_text": self.rules["checks"]["scratch"][0],
+        }
+        result = advise(row, self.rules, Path("test.sock"), 8)
+        self.assertEqual(result["status"], "CHECKLIST_FALLBACK")
+        self.assertNotEqual(result.get("llama_runtime_mode"), "PERSISTENT_WORKER")
+
+    @patch("forgesight.grounded_advice._pinned_asset_hashes")
+    @patch("forgesight.grounded_advice.assist_edge_worker.request")
+    def test_worker_identity_must_match_the_deployed_model(self, run_worker, pins):
+        row = self.assessed("scratch", "annular face")
+        run_worker.return_value = {
+            "status": "GENERATED_BY_PERSISTENT_WORKER", "worker_mode": "PERSISTENT_PROCESS",
+            "worker_started_utc": "2026-11-24T00:00:00Z", "prompt_token_count": 90,
+            "generate_ms": 1000, "generated_text": self.rules["checks"]["scratch"][0],
+            "runtime_evidence": {"artifact": {"sha256": "a" * 64},
+                                 "tokenizer": {"sha256": "b" * 64}},
+        }
+        pins.return_value = ({"c" * 64}, {"b" * 64})
+        result = advise(row, self.rules, Path("test.sock"), 8, llama_root=Path("runtime"))
+        self.assertEqual(result["status"], "CHECKLIST_FALLBACK")
+        self.assertNotEqual(result["llama_runtime_mode"], "PERSISTENT_WORKER")
+        pins.return_value = ({"a" * 64}, {"b" * 64})
+        result = advise(row, self.rules, Path("test.sock"), 8, llama_root=Path("runtime"))
+        self.assertEqual(result["status"], "LLAMA_ADVICE")
+        pins.assert_called_with(Path("runtime"))
+
+    @patch("forgesight.grounded_advice.assist_edge_worker.request")
+    def test_malformed_worker_reports_keep_the_checklist_fallback(self, run_worker):
+        for reply in (["bad report"], {"runtime_evidence": ["bad evidence"]},
+                      {"runtime_evidence": {"artifact": ["bad artifact"]}}):
+            with self.subTest(reply=reply):
+                run_worker.return_value = reply
+                result = advise(self.record, self.rules, Path("test.sock"), 8)
+                self.assertEqual(result["status"], "CHECKLIST_FALLBACK")

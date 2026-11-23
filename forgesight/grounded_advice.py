@@ -8,6 +8,9 @@ import time
 
 from . import assist_edge_worker
 from .assist_contract import AdvisoryRefusal, DEFAULT_GUIDANCE, canonical_hash, prepare_advisory
+from .assist_jetson_replay_once import (
+    _pinned_asset_hashes, _valid_sha256, _valid_utc_timestamp,
+)
 from .grade import grade_record
 
 
@@ -113,20 +116,43 @@ def selected_check(text):
     return normalized(field.group(1) if field else text)
 
 
-def advise(record, rules, socket, timeout):
+def advise(record, rules, socket, timeout, llama_root=None):
     try:
         request, notes, report = prepare(record, rules)
     except AdvisoryRefusal as error:
         return {"status": "INSPECTION_WITHHELD", "reason_code": error.code}
 
     report.update(status="CHECKLIST_FALLBACK", advice=next(iter(notes.values())),
-                  action_origin="PROTOTYPE_CHECKLIST", reason_origin="SAVED_VISION_EVIDENCE")
+                  action_origin="PROTOTYPE_CHECKLIST", reason_origin="SAVED_VISION_EVIDENCE",
+                  llama_runtime_mode="NOT_REQUESTED")
     started = time.perf_counter()
     try:
         if socket is None:
             raise ConnectionError("The persistent Llama worker is not ready.")
+        report["llama_runtime_mode"] = "PERSISTENT_WORKER_UNAVAILABLE"
         reply = assist_edge_worker.request(socket, request, timeout_seconds=timeout,
                                            connect_retries=1)
+        if not isinstance(reply, dict):
+            raise ValueError("Persistent worker report must be an object.")
+        evidence = reply.get("runtime_evidence") or {}
+        if (not isinstance(evidence, dict)
+                or not isinstance(evidence.get("artifact"), dict)
+                or not isinstance(evidence.get("tokenizer"), dict)):
+            raise ValueError("Persistent worker report lacks asset evidence objects.")
+        artifact = evidence["artifact"].get("sha256")
+        tokenizer = evidence["tokenizer"].get("sha256")
+        if (reply.get("status") != "GENERATED_BY_PERSISTENT_WORKER"
+                or reply.get("worker_mode") != "PERSISTENT_PROCESS"
+                or not _valid_utc_timestamp(reply.get("worker_started_utc"))
+                or not _valid_sha256(artifact) or not _valid_sha256(tokenizer)):
+            raise ValueError("Persistent worker response lacks verified runtime evidence.")
+        pinned = _pinned_asset_hashes(llama_root)
+        if pinned is not None and (artifact not in pinned[0] or tokenizer not in pinned[1]):
+            raise ValueError("Persistent worker evidence does not match the pinned assets.")
+        report["worker"] = {"worker_mode": reply["worker_mode"],
+                            "worker_started_utc": reply["worker_started_utc"],
+                            "model_sha256": artifact, "tokenizer_sha256": tokenizer}
+        report["llama_runtime_mode"] = "PERSISTENT_WORKER"
         report["prompt_tokens"] = reply["prompt_token_count"]
         report["generation_ms"] = reply["generate_ms"]
         matching_note = notes.get(selected_check(reply["generated_text"]))
@@ -135,7 +161,11 @@ def advise(record, rules, socket, timeout):
                           action_origin="LLAMA_MATCHED_APPROVED_CHECK")
         else:
             report["fallback_reason"] = "UNAPPROVED_MODEL_OUTPUT"
-    except (OSError, RuntimeError, KeyError, ValueError) as error:
+    except TimeoutError as error:
+        report["fallback_reason"] = "WORKER_TIMEOUT"
+        report["persistent_worker_unhealthy"] = True
+        report["worker_error"] = str(error)
+    except (OSError, RuntimeError, KeyError, ValueError, TypeError) as error:
         report["fallback_reason"] = "WORKER_UNAVAILABLE"
         report["worker_error"] = str(error)
     report["advice_elapsed_ms"] = round((time.perf_counter() - started) * 1000, 2)
@@ -147,11 +177,14 @@ def main():
     parser.add_argument("--record", type=Path, required=True)
     parser.add_argument("--socket", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=8)
+    parser.add_argument("--llama-root", type=Path,
+                        default=Path.home() / ".local/share/forgesight/llama_cpu_v1")
     args = parser.parse_args()
     if not 0 < args.timeout <= 30:
         parser.error("--timeout must be above 0 and at most 30 seconds.")
     try:
-        report = advise(read_json(args.record), read_json(RULES), args.socket, args.timeout)
+        report = advise(read_json(args.record), read_json(RULES), args.socket, args.timeout,
+                        llama_root=args.llama_root)
     except (OSError, KeyError, TypeError, ValueError) as error:
         parser.exit(2, f"Cannot read inspection or procedure: {error}\n")
     print(json.dumps(report, indent=2, allow_nan=False))
