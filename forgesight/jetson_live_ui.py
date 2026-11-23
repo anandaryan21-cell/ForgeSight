@@ -120,6 +120,8 @@ def launch_advice_worker(args, python_command=None):
                "--socket", str(args.llama_worker_socket),
                "--llama-root", str(args.llama_root),
                "--idle-timeout-seconds", str(args.llama_worker_idle_timeout_seconds)]
+    if getattr(args, "grounded_auto_advice", False):
+        command = ["nice", "-n", "10", *command]
     env = dict(os.environ)
     env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
     worker = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -349,6 +351,13 @@ class LiveService:
         self.advice_root = args.advice_root
         self.advice_queue = AdvisoryQueue()
         self.advice_futures = {}
+        self.grounded_advice = None
+        if getattr(args, "grounded_auto_advice", False):
+            from forgesight.grounded_live import GroundedLive
+            self.grounded_advice = GroundedLive(
+                self.advice_queue, self.advice_root / "grounded",
+                args.llama_worker_socket, args.llama_timeout_seconds,
+                worker_unhealthy=self._respawn_advice_worker, llama_root=args.llama_root)
         self.llama_ready = (args.guidance.is_file()
                             and (args.llama_root / "venv/bin/python").is_file()
                             and (args.llama_root / "model/llama3_2_1b_xnnpack.pte").is_file())
@@ -632,6 +641,8 @@ class LiveService:
             self.advice_futures.pop(key, None)
 
     def request_advice(self, advisory_mode="composed"):
+        if getattr(self, "grounded_advice", None) is not None:
+            raise ValueError("This station starts advice automatically after an inspection.")
         # The UI's single button requests "auto". Resolve it only from the
         # saved assessment and enabled profile, then validate the chosen
         # contract below before queuing any advisory work.
@@ -763,10 +774,13 @@ class LiveService:
             busy = self.busy
         reviews = (self.store.corrections(latest["inspection_id"])
                    if latest and latest.get("inspection_id") else [])
+        grounded = getattr(self, "grounded_advice", None)
         return {"camera": self.camera.state(), "busy": busy, "latest": latest,
                 "manual_reviews": reviews,
+                "grounded_auto_advice": grounded is not None,
                 "vision_advice_available": bool(getattr(self.args, "defect_type_profile", None)),
-                "advice": self.advice_state(),
+                "advice": (grounded.state(latest, self._grounded_worker_available())
+                           if grounded is not None else self.advice_state()),
                 "replay_samples": sorted(self.replay_samples),
                 "local_replay_samples": self.local_replay_samples,
                 "history": [{"part_id": r["part_id"], "inspection_id": r["inspection_id"],
@@ -1124,6 +1138,9 @@ class LiveService:
             latest = {"status": "ERROR", "part_id": part_id,
                       "error": (result.stderr or result.stdout)[-1000:] or "Inspection process failed"}
         with self.lock:
+            grounded = getattr(self, "grounded_advice", None)
+            if record is not None and grounded is not None:
+                grounded.submit(record, self._grounded_worker_ready)
             self.latest_root = result_root
             self.latest_source = image
             self.latest = latest
@@ -1134,6 +1151,17 @@ class LiveService:
         else:
             _log.error("Inspection for part %s failed before a record was confirmed: %s",
                        part_id, latest.get("error"))
+
+    def _grounded_worker_available(self):
+        return (not getattr(self, "advice_worker_respawning", False)
+                and self.advice_worker is not None and self.advice_worker.poll() is None)
+
+    def _grounded_worker_ready(self):
+        if self._grounded_worker_available():
+            return True
+        if self.llama_ready:
+            self._respawn_advice_worker()
+        return False
 
     def inspect(self, part_id, confirmed, source_kind):
         if (not isinstance(part_id, str) or not PART_ID.fullmatch(part_id)
@@ -1384,6 +1412,8 @@ def main():
     parser.add_argument("--guidance", type=Path, default=Path("guidance/prototype_inspection_v2.json"))
     parser.add_argument("--llama-worker-socket", type=Path, default=None,
                         help="Optional persistent advisory worker socket; omit for the per-request cold path")
+    parser.add_argument("--grounded-auto-advice", action="store_true",
+                        help="Queue grounded advice automatically for flagged inspections.")
     parser.add_argument("--llama-worker-idle-timeout-seconds", type=float, default=900,
                         help="Idle advisory worker exit so its memory is released (default 900)")
     parser.add_argument("--llama-root", type=Path,
@@ -1409,6 +1439,8 @@ def main():
         parser.error("Advisory worker idle timeout must be 60-3600 seconds.")
     if not 0 < args.llama_timeout_seconds <= 240:
         parser.error("Use a Llama timeout between 0 and 240 seconds")
+    if args.grounded_auto_advice and args.llama_worker_socket is None:
+        parser.error("--grounded-auto-advice requires a dedicated --llama-worker-socket")
     if not 1 <= args.vision_worker_threads <= 4:
         parser.error("Use one to four vision worker threads")
     if args.vision_worker_socket is not None and args.vision_worker_idle_timeout_seconds < 60:
@@ -1424,6 +1456,8 @@ def main():
     args.guidance = args.guidance.resolve()
     args.llama_root = args.llama_root.resolve()
     args.advice_root = args.advice_root.resolve()
+    if args.llama_worker_socket is not None:
+        args.llama_worker_socket = args.llama_worker_socket.resolve()
     if args.vision_worker_socket is not None:
         # The worker itself refuses only a live socket and reclaims a stale one.
         args.vision_worker_socket = args.vision_worker_socket.resolve()

@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "approval_status": "PROTOTYPE_PENDING_SITE_QC_APPROVAL",
+  "checks": {
+    "scratch": [
+      "Inspect the highlighted surface for a groove.",
+      "Compare the highlighted surface with a reference nut."
+    ],
+    "bent": [
+      "Compare the highlighted profile with a reference nut.",
+      "Inspect the highlighted edge for distortion."
+    ],
+    "flip": [
+      "Verify the fixture orientation and recapture.",
+      "Compare the visible face with the reference nut."
+    ],
+    "discoloration": [
+      "Compare the highlighted area with a reference under the same lighting.",
+      "Inspect the highlighted area for a finish difference."
+    ],
+    "unknown": [
+      "Manually inspect the highlighted area."
+    ],
+    "uncertain": [
+      "Manually inspect the whole nut."
+    ],
+    "inner_rim": [
+      "Manually inspect the highlighted thread opening."
+    ],
+    "camera": [
+      "Manually inspect the part and verify the highlighted response."
+    ],
+    "screen_photo": [
+      "Use the original image for benchmark inspection."
+    ]
+  }
+}

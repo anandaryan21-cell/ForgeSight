@@ -244,6 +244,20 @@ class DashboardBrowserTests(unittest.TestCase):
         self.assertEqual(path, '/api/advice')
         self.assertEqual(json.loads(body), {'mode': 'auto'})
 
+    def test_automatic_advice_hides_manual_button_and_preserves_recorded_runtime(self):
+        self.state['grounded_auto_advice'] = True
+        self.state['advice'] = dict(status='LLAMA_ADVICE',
+                                   advisory=dict(note='Inspect the highlighted surface.'),
+                                   llama_runtime='PERSISTENT_WORKER',
+                                   advice_worker_available_now=False)
+        self.refresh()
+        expect(self.page.locator('#advice-request')).to_be_hidden()
+        expect(self.page.locator('#advice-vision-request')).to_have_count(0)
+        expect(self.page.locator('#advice-note')).to_have_text('Inspect the highlighted surface.')
+        expect(self.page.locator('#advice-runtime')).to_contain_text('This request used the warm')
+        expect(self.page.locator('#advice-runtime')).to_contain_text('Worker now: unavailable.')
+        self.assertEqual(self.posts, [])
+
     def test_image_failure_has_placeholder_and_retains_grade(self):
         self.bad_media.add('/api/inspection/fixture-new/overlay.png')
         self.state['latest']['inspection_id'] = 'fixture-new'
